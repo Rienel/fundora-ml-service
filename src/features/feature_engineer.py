@@ -252,6 +252,10 @@ class FeatureEngineer:
     @staticmethod
     def load(path='data/processed/feature_engineer.pkl'):
         """Load a saved feature engineer"""
+        import sys
+        if 'src.features.feature_engineer' not in sys.modules:
+            import src.features.feature_engineer
+        
         return joblib.load(path)
 
 

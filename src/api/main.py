@@ -29,6 +29,7 @@ async def lifespan(app: FastAPI):
         print("Model loaded successfully")
         
         print("Loading feature engineer...")
+        import src.features.feature_engineer
         feature_engineer = FeatureEngineer.load('data/processed/feature_engineer.pkl')
         print("Feature engineer loaded successfully")
         
