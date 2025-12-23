@@ -97,6 +97,9 @@ class DataCollector:
         # Export to CSV
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
+        import os
+        os.makedirs('data/raw', exist_ok=True)
+        
         startups_df.to_csv(f'data/raw/startups_{timestamp}.csv', index=False)
         interactions_df.to_csv(f'data/raw/interactions_{timestamp}.csv', index=False)
         users_df.to_csv(f'data/raw/users_{timestamp}.csv', index=False)
