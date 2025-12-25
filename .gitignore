@@ -34,17 +34,15 @@ ENV/
 # Environment variables
 .env
 
-# Data files
+# Data files - CSVs and Parquet only
 data/raw/*.csv
 data/raw/*.parquet
 data/processed/*.csv
 data/processed/*.parquet
 
-# Models
-data/models/*.pkl
-data/models/*.joblib
-*.pkl
-*.joblib
+!data/processed/feature_engineer.pkl
+!data/models/*.pkl
+!data/models/*.joblib
 
 # Jupyter Notebooks
 .ipynb_checkpoints
