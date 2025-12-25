@@ -24,12 +24,22 @@ async def lifespan(app: FastAPI):
     
     # Startup
     try:
+        import sys
+        import os
+        
+        # Add the project root to Python path
+        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        
+        from src.features.feature_engineer import FeatureEngineer
+        from src.models.recommender import StartupRecommender
+        
         print("Loading ML model...")
         model = StartupRecommender.load('data/models/recommender_latest.pkl')
         print("Model loaded successfully")
         
         print("Loading feature engineer...")
-        import src.features.feature_engineer
         feature_engineer = FeatureEngineer.load('data/processed/feature_engineer.pkl')
         print("Feature engineer loaded successfully")
         
