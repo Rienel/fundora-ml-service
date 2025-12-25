@@ -27,29 +27,68 @@ async def lifespan(app: FastAPI):
         import sys
         import os
         
-        # Add the project root to Python path
-        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        current_file = os.path.abspath(__file__)  # /path/to/src/api/main.py
+        api_dir = os.path.dirname(current_file)    # /path/to/src/api
+        src_dir = os.path.dirname(api_dir)         # /path/to/src
+        project_root = os.path.dirname(src_dir)    # /path/to/project
+        
+        print(f"Project root: {project_root}")
+        
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
         
         from src.features.feature_engineer import FeatureEngineer
         from src.models.recommender import StartupRecommender
         
+        # Build absolute paths
+        model_path = os.path.join(project_root, 'data', 'models', 'recommender_latest.pkl')
+        fe_path = os.path.join(project_root, 'data', 'processed', 'feature_engineer.pkl')
+        
+        print(f"Model path: {model_path}")
+        print(f"FE path: {fe_path}")
+        print(f"Model exists: {os.path.exists(model_path)}")
+        print(f"FE exists: {os.path.exists(fe_path)}")
+        
         print("Loading ML model...")
-        model = StartupRecommender.load('data/models/recommender_latest.pkl')
-        print("Model loaded successfully")
+        try:
+            model = StartupRecommender.load(model_path)
+            print(f"Model loaded: {model is not None}")
+        except Exception as e:
+            print(f"Model error: {e}")
+            import traceback
+            traceback.print_exc()
+            model = None
         
         print("Loading feature engineer...")
-        feature_engineer = FeatureEngineer.load('data/processed/feature_engineer.pkl')
-        print("Feature engineer loaded successfully")
+        try:
+            feature_engineer = FeatureEngineer.load(fe_path)
+            print(f"Feature engineer loaded: {feature_engineer is not None}")
+            
+            # Verify it has the expected attributes
+            if feature_engineer:
+                print(f"   - Has startup_features: {hasattr(feature_engineer, 'startup_features')}")
+                print(f"   - Has user_preferences: {hasattr(feature_engineer, 'user_preferences')}")
+                
+        except Exception as e:
+            print(f"Feature engineer error: {e}")
+            import traceback
+            traceback.print_exc()
+            feature_engineer = None
+        
+        print(f"\nFinal status:")
+        print(f"   Model loaded: {model is not None}")
+        print(f"   Feature engineer loaded: {feature_engineer is not None}")
         
     except Exception as e:
-        print(f"Error loading model: {e}")
-        print("API will run in degraded mode")
+        print(f"Critical startup error: {e}")
+        import traceback
+        traceback.print_exc()
+        model = None
+        feature_engineer = None
     
     yield  # Server runs here
     
-    # Shutdown (cleanup if needed)
+    # Shutdown
     print("Shutting down ML service...")
 
 # Initialize FastAPI app with lifespan
