@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from contextlib import asynccontextmanager
+from fastapi.middleware.cors import CORSMiddleware
 import joblib
 import os
 from datetime import datetime
@@ -12,6 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.features.feature_engineer import FeatureEngineer
 from src.models.recommender import StartupRecommender
+from src.models.ai_recommender import AIRecommender
 
 # Global variables for model and feature engineer
 model = None
@@ -39,6 +41,7 @@ async def lifespan(app: FastAPI):
         
         from src.features.feature_engineer import FeatureEngineer
         from src.models.recommender import StartupRecommender
+        from src.models.ai_recommender import AIRecommender
         
         # Build absolute paths
         model_path = os.path.join(project_root, 'data', 'models', 'recommender_latest.pkl')
@@ -51,7 +54,7 @@ async def lifespan(app: FastAPI):
         
         print("Loading ML model...")
         try:
-            model = StartupRecommender.load(model_path)
+            model = AIRecommender.load(model_path.replace('recommender', 'ai_hybrid_recommender'))
             print(f"Model loaded: {model is not None}")
         except Exception as e:
             print(f"Model error: {e}")
@@ -97,6 +100,15 @@ app = FastAPI(
     description="AI-powered startup recommendations for Fundora",
     version="1.0.0",
     lifespan=lifespan
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Models for API requests/responses
@@ -293,7 +305,7 @@ async def record_feedback(
 if __name__ == "__main__":
     import uvicorn
     
-    port = int(os.getenv("API_PORT", 8000))
+    port = int(os.getenv("API_PORT", 8001))
     
     print("\n" + "="*60)
     print("Starting Fundora ML Recommendation Service")
