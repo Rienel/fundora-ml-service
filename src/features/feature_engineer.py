@@ -301,7 +301,7 @@ if __name__ == "__main__":
     
     # Get training data
     X, y = fe.get_training_data()
-    print(f"\n📊 Training Data Shape:")
+    print(f"\nTraining Data Shape:")
     print(f"Features (X): {X.shape}")
     print(f"Labels (y): {y.shape}")
     print(f"Feature columns: {fe.feature_columns}")
