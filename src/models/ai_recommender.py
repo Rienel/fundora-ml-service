@@ -5,573 +5,444 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import joblib
 import os
+import json
+import requests
 from datetime import datetime
-import matplotlib.pyplot as plt
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    confusion_matrix,
-    ConfusionMatrixDisplay,
-    classification_report,
-    accuracy_score
-)
 
+
+# ──────────────────────────────────────────────────────────
+# Gemini LLM Client
+# ──────────────────────────────────────────────────────────
+
+class GeminiClient:
+    MODEL = "gemini-1.5-flash"
+    BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
+        if not self.api_key:
+            print("⚠️  GEMINI_API_KEY not set — AI explanations will be disabled.")
+
+    def generate(self, prompt: str, max_tokens: int = 300) -> str:
+        """Send a prompt to Gemini and return the text response."""
+        if not self.api_key:
+            return ""
+
+        url = f"{self.BASE_URL}/{self.MODEL}:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.7},
+        }
+
+        try:
+            resp = requests.post(url, json=payload, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            print(f"Gemini API error: {e}")
+            return ""
+
+
+# ──────────────────────────────────────────────────────────
+# Main AI Recommender
+# ──────────────────────────────────────────────────────────
 
 class AIRecommender:
-    def __init__(self):
-        # ML Model
+    """
+    Hybrid recommendation engine:
+      • 40 % — Random Forest ML (engagement prediction)
+      • 30 % — Collaborative Filtering (similar investors)
+      • 30 % — Content-Based (TF-IDF startup similarity)
+      + Gemini LLM explains every recommendation in plain English
+    """
+
+    def __init__(self, gemini_api_key: str = None):
+        # ML model
         self.model = RandomForestClassifier(
             n_estimators=100,
             max_depth=10,
             min_samples_split=5,
             random_state=42,
-            class_weight='balanced'
+            class_weight="balanced",
         )
-        
-        # Use TfidfVectorizer instead of transformers
-        self.text_vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
-        
+
+        # NLP
+        self.text_vectorizer = TfidfVectorizer(max_features=100, stop_words="english")
+
+        # State
         self.feature_columns = None
         self.is_trained = False
-        
-        # Cache for embeddings and similarities
-        self.startup_embeddings = {}
+        self.startup_embeddings: dict = {}
         self.user_similarity_matrix = None
-    
-    def encode_startup_text(self, startup_row):
-        """Convert startup text to vector (using TF-IDF instead of transformers)"""
-        # Combine relevant text fields
-        text_parts = []
-        
-        if 'company_name' in startup_row and pd.notna(startup_row['company_name']):
-            text_parts.append(str(startup_row['company_name']))
-        
-        if 'industry' in startup_row and pd.notna(startup_row['industry']):
-            text_parts.append(str(startup_row['industry']))
-        
-        if 'tagline' in startup_row and pd.notna(startup_row.get('tagline')):
-            text_parts.append(str(startup_row['tagline']))
-        
-        text = " ".join(text_parts)
-        
-        if not text.strip():
-            return None
-        
-        return text  # Return text, will be vectorized in batch
-    
+        self.user_ids: list = []
+
+        # LLM
+        self.gemini = GeminiClient(gemini_api_key)
+
+    # ── text helpers ──────────────────────────────────────
+
+    def _startup_text(self, row) -> str:
+        parts = []
+        for field in ("company_name", "industry", "tagline", "description"):
+            val = row.get(field)
+            if val and pd.notna(val):
+                parts.append(str(val))
+        return " ".join(parts)
+
+    # ── embedding layer ───────────────────────────────────
+
     def build_startup_embeddings(self, feature_engineer):
-        """Pre-compute embeddings for all startups using TF-IDF"""
-        print("Building startup text embeddings (using TF-IDF)...")
-        
-        texts = []
-        startup_ids = []
-        
-        for idx, startup in feature_engineer.startup_features.iterrows():
-            startup_id = startup['id']
-            text = self.encode_startup_text(startup)
-            if text:
-                texts.append(text)
-                startup_ids.append(startup_id)
-        
+        print("Building TF-IDF startup embeddings…")
+        texts, ids = [], []
+        for _, row in feature_engineer.startup_features.iterrows():
+            t = self._startup_text(row)
+            if t:
+                texts.append(t)
+                ids.append(row["id"])
+
         if not texts:
-            print("No text data found for embeddings")
+            print("No text data found — skipping embeddings.")
             return
-        
-        # Fit and transform all texts at once
-        try:
-            embeddings_matrix = self.text_vectorizer.fit_transform(texts).toarray()
-            
-            # Store embeddings
-            for startup_id, embedding in zip(startup_ids, embeddings_matrix):
-                self.startup_embeddings[startup_id] = embedding
-            
-            print(f"Built TF-IDF embeddings for {len(self.startup_embeddings)} startups")
-        except Exception as e:
-            print(f"Error building embeddings: {e}")
-    
+
+        matrix = self.text_vectorizer.fit_transform(texts).toarray()
+        for sid, emb in zip(ids, matrix):
+            self.startup_embeddings[sid] = emb
+        print(f"  Built embeddings for {len(self.startup_embeddings)} startups.")
+
+    # ── collaborative filtering ───────────────────────────
+
     def compute_user_similarity_matrix(self, feature_engineer):
-        """Build user-user similarity matrix for collaborative filtering"""
-        print("Computing user similarity matrix...")
-        
-        # Create user-startup interaction matrix
+        print("Computing user similarity matrix…")
         interactions = feature_engineer.interactions_df
-        
-        # Pivot to create user-item matrix
-        user_item_matrix = interactions.pivot_table(
-            index='user_id',
-            columns='startup_id',
-            values='engagement_level',
-            fill_value=0
+        mat = interactions.pivot_table(
+            index="user_id",
+            columns="startup_id",
+            values="engagement_level",
+            fill_value=0,
         )
-        
-        # Compute cosine similarity between users
-        if len(user_item_matrix) > 1:
-            self.user_similarity_matrix = cosine_similarity(user_item_matrix)
-            self.user_ids = user_item_matrix.index.tolist()
-            print(f"Computed similarity for {len(self.user_ids)} users")
+        if len(mat) > 1:
+            self.user_similarity_matrix = cosine_similarity(mat)
+            self.user_ids = mat.index.tolist()
+            print(f"  Similarity computed for {len(self.user_ids)} users.")
         else:
-            print("Not enough users for collaborative filtering")
-            self.user_similarity_matrix = None
-    
-    def get_similar_users(self, user_id, n=5):
-        """Find N most similar users using collaborative filtering"""
-        if self.user_similarity_matrix is None:
+            print("  Not enough users for collaborative filtering.")
+
+    def get_similar_users(self, user_id: int, n: int = 5) -> list:
+        if self.user_similarity_matrix is None or user_id not in self.user_ids:
             return []
-        
-        try:
-            user_idx = self.user_ids.index(user_id)
-            similarities = self.user_similarity_matrix[user_idx]
-            
-            # Get top N similar users (excluding self)
-            similar_indices = np.argsort(similarities)[::-1][1:n+1]
-            similar_user_ids = [self.user_ids[i] for i in similar_indices]
-            
-            return similar_user_ids
-        except (ValueError, IndexError):
-            return []
-    
-    def collaborative_score(self, user_id, startup_id, feature_engineer):
-        """Score based on what similar users liked"""
-        similar_users = self.get_similar_users(user_id, n=10)
-        
-        if not similar_users:
+        idx = self.user_ids.index(user_id)
+        sims = self.user_similarity_matrix[idx]
+        top = np.argsort(sims)[::-1][1 : n + 1]
+        return [self.user_ids[i] for i in top]
+
+    # ── scoring methods ───────────────────────────────────
+
+    def _collaborative_score(self, user_id, startup_id, feature_engineer) -> float:
+        similar = self.get_similar_users(user_id, n=10)
+        if not similar:
             return 0.0
-        
-        # Check how similar users interacted with this startup
-        interactions = feature_engineer.interactions_df
-        similar_interactions = interactions[
-            (interactions['user_id'].isin(similar_users)) &
-            (interactions['startup_id'] == startup_id)
-        ]
-        
-        if len(similar_interactions) == 0:
+        df = feature_engineer.interactions_df
+        sub = df[(df["user_id"].isin(similar)) & (df["startup_id"] == startup_id)]
+        if sub.empty:
             return 0.0
-        
-        # Average engagement level from similar users
-        avg_engagement = similar_interactions['engagement_level'].mean()
-        
-        # Normalize to 0-1
-        return avg_engagement / 3.0
-    
-    def content_based_score(self, user_id, startup_id, feature_engineer):
-        """Score based on similarity to startups user liked"""
-        if not self.startup_embeddings:
+        return sub["engagement_level"].mean() / 3.0
+
+    def _content_score(self, user_id, startup_id, feature_engineer) -> float:
+        if not self.startup_embeddings or startup_id not in self.startup_embeddings:
             return 0.0
-        
-        # Get startups user has engaged with (engagement >= 2)
-        user_interactions = feature_engineer.interactions_df[
-            (feature_engineer.interactions_df['user_id'] == user_id) &
-            (feature_engineer.interactions_df['engagement_level'] >= 2)
-        ]
-        
-        if len(user_interactions) == 0:
+        df = feature_engineer.interactions_df
+        liked = df[(df["user_id"] == user_id) & (df["engagement_level"] >= 2)][
+            "startup_id"
+        ].tolist()
+        embs = [self.startup_embeddings[s] for s in liked if s in self.startup_embeddings]
+        if not embs:
             return 0.0
-        
-        liked_startup_ids = user_interactions['startup_id'].tolist()
-        
-        # Get embeddings for liked startups
-        liked_embeddings = []
-        for sid in liked_startup_ids:
-            if sid in self.startup_embeddings:
-                liked_embeddings.append(self.startup_embeddings[sid])
-        
-        if not liked_embeddings or startup_id not in self.startup_embeddings:
-            return 0.0
-        
-        # Average embedding of liked startups
-        avg_liked_embedding = np.mean(liked_embeddings, axis=0)
-        
-        # Compare with candidate startup
-        candidate_embedding = self.startup_embeddings[startup_id]
-        
-        # Cosine similarity
-        similarity = cosine_similarity(
-            avg_liked_embedding.reshape(1, -1),
-            candidate_embedding.reshape(1, -1)
-        )[0][0]
-        
-        # Already in [0, 1] range for TF-IDF
-        return max(0, similarity)
-    
-    def ml_prediction_score(self, user_id, startup_id, feature_engineer):
-        """Score from ML model prediction"""
+        avg = np.mean(embs, axis=0)
+        sim = cosine_similarity(avg.reshape(1, -1), self.startup_embeddings[startup_id].reshape(1, -1))[0][0]
+        return max(0.0, float(sim))
+
+    def _ml_score(self, user_id, startup_id, feature_engineer) -> float:
         if not self.is_trained:
             return 0.0
-        
-        # Get startup features
         startup = feature_engineer.startup_features[
-            feature_engineer.startup_features['id'] == startup_id
+            feature_engineer.startup_features["id"] == startup_id
         ]
-        
-        if len(startup) == 0:
+        if startup.empty:
             return 0.0
-        
         startup = startup.iloc[0]
-        
-        # Get user preferences
-        user_pref = feature_engineer.user_preferences[
-            feature_engineer.user_preferences['user_id'] == user_id
+        pref = feature_engineer.user_preferences[
+            feature_engineer.user_preferences["user_id"] == user_id
         ]
-        
-        if len(user_pref) == 0:
-            user_pref = {'total_views': 0, 'avg_engagement': 0}
-        else:
-            user_pref = user_pref.iloc[0].to_dict()
-        
-        # Create feature vector
-        features = {
-            'revenue': startup.get('revenue', 0),
-            'net_income': startup.get('net_income', 0),
-            'profit_margin': startup.get('profit_margin', 0),
-            'revenue_growth': startup.get('revenue_growth', 0),
-            'expected_return': startup.get('expected_return', 0),
-            'current_ratio': startup.get('current_ratio', 0),
-            'debt_to_assets': startup.get('debt_to_assets', 0),
-            'confidence_score': startup.get('confidence_score', 0),
-            'is_deck_builder': startup.get('is_deck_builder', 0),
-            'view_count': startup.get('view_count', 0),
-            'unique_viewers': startup.get('unique_viewers', 0),
-            'avg_engagement': startup.get('avg_engagement', 0),
-            'industry_encoded': startup.get('industry_encoded', 0),
-            'user_total_views': user_pref.get('total_views', 0),
-            'user_avg_engagement': user_pref.get('avg_engagement', 0),
+        pref = pref.iloc[0].to_dict() if not pref.empty else {"total_views": 0, "avg_engagement": 0}
+
+        feat = {
+            "revenue": startup.get("revenue", 0),
+            "net_income": startup.get("net_income", 0),
+            "profit_margin": startup.get("profit_margin", 0),
+            "revenue_growth": startup.get("revenue_growth", 0),
+            "expected_return": startup.get("expected_return", 0),
+            "current_ratio": startup.get("current_ratio", 0),
+            "debt_to_assets": startup.get("debt_to_assets", 0),
+            "confidence_score": startup.get("confidence_score", 0),
+            "is_deck_builder": startup.get("is_deck_builder", 0),
+            "view_count": startup.get("view_count", 0),
+            "unique_viewers": startup.get("unique_viewers", 0),
+            "avg_engagement": startup.get("avg_engagement", 0),
+            "industry_encoded": startup.get("industry_encoded", 0),
+            "user_total_views": pref.get("total_views", 0),
+            "user_avg_engagement": pref.get("avg_engagement", 0),
         }
-        
-        # Convert to array
-        X = np.array([features[col] for col in self.feature_columns]).reshape(1, -1)
-        
-        # Predict probability
+        X = np.array([feat[c] for c in self.feature_columns]).reshape(1, -1)
         proba = self.model.predict_proba(X)[0]
-        
-        # Weighted score
-        score = proba[0] * 1 + proba[1] * 2 + proba[2] * 3
-        return score / 3.0  # Normalize to 0-1
-    
-    def hybrid_score(self, user_id, startup_id, feature_engineer, weights=None):
+        return (proba[0] * 1 + proba[1] * 2 + proba[2] * 3) / 3.0
+
+    def hybrid_score(self, user_id, startup_id, feature_engineer, weights=None) -> dict:
+        w = weights or {"ml": 0.4, "collaborative": 0.3, "content": 0.3}
+        ml  = self._ml_score(user_id, startup_id, feature_engineer)
+        col = self._collaborative_score(user_id, startup_id, feature_engineer)
+        con = self._content_score(user_id, startup_id, feature_engineer)
+        total = w["ml"] * ml + w["collaborative"] * col + w["content"] * con
+        return {"total_score": total, "ml_score": ml, "collaborative_score": col, "content_score": con}
+
+    # ── Gemini LLM explanation ────────────────────────────
+
+    def generate_ai_explanation(self, user_id, startup_id, feature_engineer) -> str:
         """
-        Combine all scoring methods
-        
-        weights: dict with keys 'ml', 'collaborative', 'content'
-        Default: 40% ML, 30% Collaborative, 30% Content-based
+        Ask Gemini to write a short, human-friendly explanation of WHY
+        this startup was recommended to this investor.
+        Falls back to a rule-based explanation if Gemini is unavailable.
         """
-        if weights is None:
-            weights = {
-                'ml': 0.4,
-                'collaborative': 0.3,
-                'content': 0.3
-            }
-        
-        ml_score = self.ml_prediction_score(user_id, startup_id, feature_engineer)
-        collab_score = self.collaborative_score(user_id, startup_id, feature_engineer)
-        content_score = self.content_based_score(user_id, startup_id, feature_engineer)
-        
-        final_score = (
-            weights['ml'] * ml_score +
-            weights['collaborative'] * collab_score +
-            weights['content'] * content_score
+        startup = feature_engineer.startup_features[
+            feature_engineer.startup_features["id"] == startup_id
+        ]
+        if startup.empty:
+            return "Recommended based on your investment profile."
+        startup = startup.iloc[0]
+
+        pref = feature_engineer.user_preferences[
+            feature_engineer.user_preferences["user_id"] == user_id
+        ]
+        preferred_industry = (
+            pref.iloc[0].get("preferred_industry", "technology") if not pref.empty else "technology"
         )
-        
-        return {
-            'total_score': final_score,
-            'ml_score': ml_score,
-            'collaborative_score': collab_score,
-            'content_score': content_score
+
+        # Build a concise data summary for the prompt
+        startup_summary = {
+            "name": startup.get("company_name", "Unknown"),
+            "industry": startup.get("industry", "Unknown"),
+            "revenue_growth_pct": round(float(startup.get("revenue_growth", 0) or 0) * 100, 1),
+            "expected_return_pct": round(float(startup.get("expected_return", 0) or 0), 1),
+            "profit_margin_pct": round(float(startup.get("profit_margin", 0) or 0) * 100, 1),
+            "current_ratio": round(float(startup.get("current_ratio", 0) or 0), 2),
+            "confidence_score_pct": round(float(startup.get("confidence_score", 0) or 0) * 100, 1),
         }
-    
+
+        scores = self.hybrid_score(user_id, startup_id, feature_engineer)
+
+        prompt = f"""You are an AI investment advisor for Fundora, a startup investment platform.
+
+A startup called "{startup_summary['name']}" in the {startup_summary['industry']} industry has been 
+recommended to an investor whose preferred industry is {preferred_industry}.
+
+Key financial metrics:
+- Revenue Growth: {startup_summary['revenue_growth_pct']}%
+- Expected Return: {startup_summary['expected_return_pct']}%
+- Profit Margin: {startup_summary['profit_margin_pct']}%
+- Current Ratio (liquidity): {startup_summary['current_ratio']}
+- Data Confidence: {startup_summary['confidence_score_pct']}%
+
+Recommendation scores (0–1):
+- ML behavioral score: {scores['ml_score']:.2f}
+- Investor similarity score: {scores['collaborative_score']:.2f}
+- Content match score: {scores['content_score']:.2f}
+
+Write a 2–3 sentence explanation (in a friendly, professional tone) of why this startup 
+is a good match for this investor. Be specific about the numbers. Do NOT use bullet points."""
+
+        llm_text = self.gemini.generate(prompt, max_tokens=200)
+
+        # Fallback if Gemini unavailable
+        if not llm_text:
+            reasons = []
+            if startup_summary["revenue_growth_pct"] > 20:
+                reasons.append(f"{startup_summary['revenue_growth_pct']}% revenue growth")
+            if startup_summary["expected_return_pct"] > 15:
+                reasons.append(f"{startup_summary['expected_return_pct']}% expected return")
+            if startup.get("industry") == preferred_industry:
+                reasons.append(f"matches your preferred {preferred_industry} sector")
+            if not reasons:
+                reasons.append("strong overall financial profile")
+            return (
+                f"{startup_summary['name']} was recommended because of its "
+                + ", ".join(reasons) + "."
+            )
+
+        return llm_text
+
+    # ── training ──────────────────────────────────────────
+
     def train(self, X, y, feature_columns, feature_engineer):
-        """Train the hybrid recommender"""
-        print("\n" + "="*60)
-        print("TRAINING AI HYBRID RECOMMENDER")
-        print("="*60)
-        
-        # Save feature columns
+        print("\n" + "=" * 60)
+        print("TRAINING FUNDORA AI HYBRID RECOMMENDER")
+        print("=" * 60)
+
         self.feature_columns = feature_columns
-        
-        # 1. Train ML model
-        print("\n1. Training ML Model...")
+
+        # 1. ML model
+        print("\n1. Training Random Forest ML model…")
         X_train, X_val, y_train, y_val = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
-        
         self.model.fit(X_train, y_train)
-        y_pred = self.model.predict(X_val)
-        accuracy = accuracy_score(y_val, y_pred)
-        
-        print(f"   ML Model Accuracy: {accuracy:.2%}")
-        
-        # 2. Build NLP embeddings
-        print("\n2. Building NLP Components...")
+        acc = accuracy_score(y_val, self.model.predict(X_val))
+        print(f"   Validation accuracy: {acc:.2%}")
+        print(classification_report(y_val, self.model.predict(X_val),
+                                    target_names=["View", "Compare", "Watchlist"]))
+
+        # 2. NLP embeddings
+        print("\n2. Building NLP content layer…")
         self.build_startup_embeddings(feature_engineer)
-        
-        # 3. Compute user similarities
-        print("\n3. Building Collaborative Filtering...")
+
+        # 3. Collaborative filtering
+        print("\n3. Building collaborative filtering layer…")
         self.compute_user_similarity_matrix(feature_engineer)
-        
+
         self.is_trained = True
-        
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("HYBRID AI TRAINING COMPLETE")
-        print("="*60)
-        
+        print("=" * 60)
         return self
-    
-    def recommend(self, user_id, feature_engineer, n_recommendations=10, 
-                  exclude_viewed=True, weights=None):
-        """Generate hybrid AI recommendations"""
-        
-        # Get all startup IDs
-        all_startup_ids = feature_engineer.startup_features['id'].tolist()
-        
-        # Optionally exclude viewed
+
+    # ── recommend ─────────────────────────────────────────
+
+    def recommend(
+        self,
+        user_id,
+        feature_engineer,
+        n_recommendations: int = 10,
+        exclude_viewed: bool = True,
+        weights=None,
+        include_explanations: bool = False,
+    ) -> pd.DataFrame:
+        all_ids = feature_engineer.startup_features["id"].tolist()
+
         if exclude_viewed:
-            viewed_ids = feature_engineer.interactions_df[
-                feature_engineer.interactions_df['user_id'] == user_id
-            ]['startup_id'].tolist()
-            candidate_ids = [sid for sid in all_startup_ids if sid not in viewed_ids]
+            viewed = feature_engineer.interactions_df[
+                feature_engineer.interactions_df["user_id"] == user_id
+            ]["startup_id"].tolist()
+            candidates = [s for s in all_ids if s not in viewed]
         else:
-            candidate_ids = all_startup_ids
-        
-        if len(candidate_ids) == 0:
-            candidate_ids = all_startup_ids
-        
-        # Score all candidates
-        recommendations = []
-        
-        for startup_id in candidate_ids:
-            scores = self.hybrid_score(user_id, startup_id, feature_engineer, weights)
-            
-            # Get predicted engagement
-            if self.is_trained:
-                startup = feature_engineer.startup_features[
-                    feature_engineer.startup_features['id'] == startup_id
-                ].iloc[0]
-                
-                user_pref = feature_engineer.user_preferences[
-                    feature_engineer.user_preferences['user_id'] == user_id
-                ]
-                
-                if len(user_pref) == 0:
-                    user_pref = {'total_views': 0, 'avg_engagement': 0}
-                else:
-                    user_pref = user_pref.iloc[0].to_dict()
-                
-                features = {
-                    'revenue': startup.get('revenue', 0),
-                    'net_income': startup.get('net_income', 0),
-                    'profit_margin': startup.get('profit_margin', 0),
-                    'revenue_growth': startup.get('revenue_growth', 0),
-                    'expected_return': startup.get('expected_return', 0),
-                    'current_ratio': startup.get('current_ratio', 0),
-                    'debt_to_assets': startup.get('debt_to_assets', 0),
-                    'confidence_score': startup.get('confidence_score', 0),
-                    'is_deck_builder': startup.get('is_deck_builder', 0),
-                    'view_count': startup.get('view_count', 0),
-                    'unique_viewers': startup.get('unique_viewers', 0),
-                    'avg_engagement': startup.get('avg_engagement', 0),
-                    'industry_encoded': startup.get('industry_encoded', 0),
-                    'user_total_views': user_pref.get('total_views', 0),
-                    'user_avg_engagement': user_pref.get('avg_engagement', 0),
-                }
-                
-                X = np.array([features[col] for col in self.feature_columns]).reshape(1, -1)
-                predicted_engagement = self.model.predict(X)[0]
-            else:
-                predicted_engagement = 1
-            
-            recommendations.append({
-                'startup_id': startup_id,
-                'score': scores['total_score'],
-                'ml_score': scores['ml_score'],
-                'collaborative_score': scores['collaborative_score'],
-                'content_score': scores['content_score'],
-                'predicted_engagement': int(predicted_engagement)
-            })
-        
-        # Sort by total score
-        recommendations_df = pd.DataFrame(recommendations)
-        recommendations_df = recommendations_df.sort_values('score', ascending=False)
-        
-        return recommendations_df.head(n_recommendations)
-    
-    def explain_recommendation(self, user_id, startup_id, feature_engineer):
-        """Explain why this startup was recommended"""
+            candidates = all_ids
+
+        if not candidates:
+            candidates = all_ids
+
+        rows = []
+        for sid in candidates:
+            s = self.hybrid_score(user_id, sid, feature_engineer, weights)
+
+            pref = feature_engineer.user_preferences[
+                feature_engineer.user_preferences["user_id"] == user_id
+            ]
+            pref = pref.iloc[0].to_dict() if not pref.empty else {"total_views": 0, "avg_engagement": 0}
+
+            startup = feature_engineer.startup_features[
+                feature_engineer.startup_features["id"] == sid
+            ].iloc[0]
+
+            feat = {
+                "revenue": startup.get("revenue", 0),
+                "net_income": startup.get("net_income", 0),
+                "profit_margin": startup.get("profit_margin", 0),
+                "revenue_growth": startup.get("revenue_growth", 0),
+                "expected_return": startup.get("expected_return", 0),
+                "current_ratio": startup.get("current_ratio", 0),
+                "debt_to_assets": startup.get("debt_to_assets", 0),
+                "confidence_score": startup.get("confidence_score", 0),
+                "is_deck_builder": startup.get("is_deck_builder", 0),
+                "view_count": startup.get("view_count", 0),
+                "unique_viewers": startup.get("unique_viewers", 0),
+                "avg_engagement": startup.get("avg_engagement", 0),
+                "industry_encoded": startup.get("industry_encoded", 0),
+                "user_total_views": pref.get("total_views", 0),
+                "user_avg_engagement": pref.get("avg_engagement", 0),
+            }
+            X = np.array([feat[c] for c in self.feature_columns]).reshape(1, -1)
+            predicted_engagement = int(self.model.predict(X)[0]) if self.is_trained else 1
+
+            row = {
+                "startup_id": sid,
+                "score": s["total_score"],
+                "ml_score": s["ml_score"],
+                "collaborative_score": s["collaborative_score"],
+                "content_score": s["content_score"],
+                "predicted_engagement": predicted_engagement,
+            }
+            rows.append(row)
+
+        df = pd.DataFrame(rows).sort_values("score", ascending=False).head(n_recommendations)
+
+        if include_explanations:
+            df["ai_explanation"] = df["startup_id"].apply(
+                lambda sid: self.generate_ai_explanation(user_id, sid, feature_engineer)
+            )
+
+        return df
+
+    # ── explain single startup ────────────────────────────
+
+    def explain_recommendation(self, user_id, startup_id, feature_engineer) -> dict:
         scores = self.hybrid_score(user_id, startup_id, feature_engineer)
-        
         startup = feature_engineer.startup_features[
-            feature_engineer.startup_features['id'] == startup_id
+            feature_engineer.startup_features["id"] == startup_id
         ].iloc[0]
-        
-        explanation = {
-            'startup_name': startup['company_name'],
-            'overall_score': scores['total_score'],
-            'reasons': []
+
+        ai_text = self.generate_ai_explanation(user_id, startup_id, feature_engineer)
+
+        return {
+            "startup_name": startup["company_name"],
+            "overall_score": scores["total_score"],
+            "score_breakdown": {
+                "ml": scores["ml_score"],
+                "collaborative": scores["collaborative_score"],
+                "content": scores["content_score"],
+            },
+            "ai_explanation": ai_text,
         }
-        
-        # ML-based reasons
-        if scores['ml_score'] > 0.5:
-            explanation['reasons'].append(
-                f"Strong match based on your behavior patterns (ML Score: {scores['ml_score']:.2f})"
-            )
-        
-        # Collaborative filtering reasons
-        if scores['collaborative_score'] > 0.3:
-            similar_users = self.get_similar_users(user_id, n=3)
-            if similar_users:
-                explanation['reasons'].append(
-                    f"Popular among users with similar interests (Collab Score: {scores['collaborative_score']:.2f})"
-                )
-        
-        # Content-based reasons
-        if scores['content_score'] > 0.5:
-            explanation['reasons'].append(
-                f"Similar to startups you previously engaged with (Content Score: {scores['content_score']:.2f})"
-            )
-        
-        # Startup-specific reasons
-        if startup.get('revenue_growth', 0) > 50:
-            explanation['reasons'].append(
-                f"High revenue growth: {startup['revenue_growth']:.1f}%"
-            )
-        
-        if startup.get('expected_return', 0) > 20:
-            explanation['reasons'].append(
-                f"Strong expected return: {startup['expected_return']:.1f}%"
-            )
-        
-        # Industry preference
-        user_pref = feature_engineer.user_preferences[
-            feature_engineer.user_preferences['user_id'] == user_id
-        ]
-        if len(user_pref) > 0:
-            preferred_industry = user_pref.iloc[0].get('preferred_industry')
-            if preferred_industry and startup.get('industry') == preferred_industry:
-                explanation['reasons'].append(
-                    f"Matches your preferred industry: {preferred_industry}"
-                )
-        
-        return explanation
-    
-    def save(self, path='data/models/ai_hybrid_recommender_latest.pkl'):
-        """Save the trained hybrid AI recommender"""
+
+    # ── persistence ───────────────────────────────────────
+
+    def save(self, path: str = "data/models/ai_hybrid_recommender_latest.pkl"):
         if not self.is_trained:
-            raise Exception("Cannot save untrained model!")
-        
+            raise RuntimeError("Cannot save untrained model!")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        # Save everything except the NLP model (it's huge)
-        model_data = {
-            'model': self.model,
-            'feature_columns': self.feature_columns,
-            'is_trained': self.is_trained,
-            'startup_embeddings': self.startup_embeddings,
-            'user_similarity_matrix': self.user_similarity_matrix,
-            'user_ids': getattr(self, 'user_ids', None),
-            'trained_at': datetime.now().isoformat(),
-            'model_type': 'AIRecommender'
+        data = {
+            "model": self.model,
+            "feature_columns": self.feature_columns,
+            "is_trained": self.is_trained,
+            "startup_embeddings": self.startup_embeddings,
+            "user_similarity_matrix": self.user_similarity_matrix,
+            "user_ids": self.user_ids,
+            "trained_at": datetime.now().isoformat(),
+            "model_type": "AIRecommender_Gemini",
         }
-        
-        joblib.dump(model_data, path)
-        print(f"AI Hybrid Model saved to {path}")
-        
-        # Also save with timestamp
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        versioned_path = path.replace('_latest', f'_{timestamp}')
-        joblib.dump(model_data, versioned_path)
-        print(f"Version saved to {versioned_path}")
-    
+        joblib.dump(data, path)
+        print(f"Model saved to {path}")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        joblib.dump(data, path.replace("_latest", f"_{ts}"))
+
     @staticmethod
-    def load(path='data/models/ai_hybrid_recommender_latest.pkl'):
-        """Load a trained hybrid AI recommender"""
-        model_data = joblib.load(path)
-        
-        recommender = AIRecommender()
-        recommender.model = model_data['model']
-        recommender.feature_columns = model_data['feature_columns']
-        recommender.is_trained = model_data['is_trained']
-        recommender.startup_embeddings = model_data['startup_embeddings']
-        recommender.user_similarity_matrix = model_data['user_similarity_matrix']
-        recommender.user_ids = model_data.get('user_ids', [])
-        
-        print(f"AI Hybrid Model loaded from {path}")
-        print(f"   Trained at: {model_data.get('trained_at', 'Unknown')}")
-        
-        return recommender
-
-
-# Training script
-if __name__ == "__main__":
-    from src.features.feature_engineer import FeatureEngineer
-
-    print("="*60)
-    print("FUNDORA AI HYBRID RECOMMENDER - TRAINING")
-    print("="*60)
-
-    # 1. Load feature engineer and data
-    print("\n1. Loading feature engineer...")
-    fe = FeatureEngineer.load('data/processed/feature_engineer.pkl')
-
-    print("\n2. Preparing training data...")
-    X, y = fe.get_training_data()
-    feature_columns = fe.feature_columns
-    print(f"   Training examples: {len(X)}")
-    print(f"   Features: {len(feature_columns)}")
-
-    # 3. Train/validation split
-    from sklearn.model_selection import train_test_split
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
-    # 4. Create and train your ML model (same config you use inside the hybrid model)
-    from sklearn.ensemble import RandomForestClassifier
-    ml_model = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=10,
-        min_samples_split=5,
-        class_weight='balanced',
-        random_state=42
-    )
-
-    print("\n3. Training ML model...")
-    ml_model.fit(X_train, y_train)
-
-    # 5. Evaluate
-    from sklearn.metrics import (
-        confusion_matrix,
-        ConfusionMatrixDisplay,
-        classification_report,
-        accuracy_score
-    )
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    y_pred = ml_model.predict(X_val)
-    acc = accuracy_score(y_val, y_pred)
-    print(f"   Validation Accuracy: {acc:.2%}")
-    print("\nClassification Report:")
-    print(classification_report(y_val, y_pred, target_names=['View', 'Compare', 'Watchlist']))
-
-    # Confusion matrix figure
-    cm = confusion_matrix(y_val, y_pred)
-    disp = ConfusionMatrixDisplay(
-        confusion_matrix=cm,
-        display_labels=['View (1)', 'Compare (2)', 'Watchlist (3)']
-    )
-    fig, ax = plt.subplots(figsize=(8, 6))
-    disp.plot(values_format='d', cmap='Blues', ax=ax, colorbar=True)
-    
-    # Improve formatting
-    ax.set_title('Confusion Matrix of Engagement Prediction', 
-                 fontsize=14, fontweight='bold', pad=20)
-    ax.set_xlabel('Predicted Label', fontsize=12, fontweight='bold', labelpad=10)
-    ax.set_ylabel('True Label', fontsize=12, fontweight='bold', labelpad=10)
-    ax.tick_params(axis='both', which='major', labelsize=11)
-    
-    plt.tight_layout()
-    plt.savefig('fig_confusion_matrix.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print("\nSaved fig_confusion_matrix.png and fig_feature_importance.png")
+    def load(path: str = "data/models/ai_hybrid_recommender_latest.pkl", gemini_api_key: str = None):
+        data = joblib.load(path)
+        r = AIRecommender(gemini_api_key=gemini_api_key or os.getenv("GEMINI_API_KEY"))
+        r.model = data["model"]
+        r.feature_columns = data["feature_columns"]
+        r.is_trained = data["is_trained"]
+        r.startup_embeddings = data["startup_embeddings"]
+        r.user_similarity_matrix = data["user_similarity_matrix"]
+        r.user_ids = data.get("user_ids", [])
+        print(f"Model loaded — trained at {data.get('trained_at', 'unknown')}")
+        return r

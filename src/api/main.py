@@ -1,108 +1,63 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from contextlib import asynccontextmanager
-from fastapi.middleware.cors import CORSMiddleware
-import joblib
-import os
 from datetime import datetime
-import sys
+import os, sys, joblib, traceback
 
-# Add src to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+# ── path setup ────────────────────────────────────────────
+current_file  = os.path.abspath(__file__)
+api_dir       = os.path.dirname(current_file)
+src_dir       = os.path.dirname(api_dir)
+project_root  = os.path.dirname(src_dir)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from src.features.feature_engineer import FeatureEngineer
-from src.models.recommender import StartupRecommender
 from src.models.ai_recommender import AIRecommender
 
-# Global variables for model and feature engineer
-model = None
-feature_engineer = None
+# ── globals ───────────────────────────────────────────────
+model: Optional[AIRecommender] = None
+feature_engineer: Optional[FeatureEngineer] = None
 
+
+# ── lifespan ──────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for startup/shutdown"""
     global model, feature_engineer
-    
-    # Startup
-    try:
-        import sys
-        import os
-        
-        current_file = os.path.abspath(__file__)  # /path/to/src/api/main.py
-        api_dir = os.path.dirname(current_file)    # /path/to/src/api
-        src_dir = os.path.dirname(api_dir)         # /path/to/src
-        project_root = os.path.dirname(src_dir)    # /path/to/project
-        
-        print(f"Project root: {project_root}")
-        
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
-        
-        from src.features.feature_engineer import FeatureEngineer
-        from src.models.recommender import StartupRecommender
-        from src.models.ai_recommender import AIRecommender
-        
-        # Build absolute paths
-        model_path = os.path.join(project_root, 'data', 'models', 'recommender_latest.pkl')
-        fe_path = os.path.join(project_root, 'data', 'processed', 'feature_engineer.pkl')
-        
-        print(f"Model path: {model_path}")
-        print(f"FE path: {fe_path}")
-        print(f"Model exists: {os.path.exists(model_path)}")
-        print(f"FE exists: {os.path.exists(fe_path)}")
-        
-        print("Loading ML model...")
-        try:
-            model = AIRecommender.load(model_path.replace('recommender', 'ai_hybrid_recommender'))
-            print(f"Model loaded: {model is not None}")
-        except Exception as e:
-            print(f"Model error: {e}")
-            import traceback
-            traceback.print_exc()
-            model = None
-        
-        print("Loading feature engineer...")
-        try:
-            feature_engineer = FeatureEngineer.load(fe_path)
-            print(f"Feature engineer loaded: {feature_engineer is not None}")
-            
-            # Verify it has the expected attributes
-            if feature_engineer:
-                print(f"   - Has startup_features: {hasattr(feature_engineer, 'startup_features')}")
-                print(f"   - Has user_preferences: {hasattr(feature_engineer, 'user_preferences')}")
-                
-        except Exception as e:
-            print(f"Feature engineer error: {e}")
-            import traceback
-            traceback.print_exc()
-            feature_engineer = None
-        
-        print(f"\nFinal status:")
-        print(f"   Model loaded: {model is not None}")
-        print(f"   Feature engineer loaded: {feature_engineer is not None}")
-        
-    except Exception as e:
-        print(f"Critical startup error: {e}")
-        import traceback
-        traceback.print_exc()
-        model = None
-        feature_engineer = None
-    
-    yield  # Server runs here
-    
-    # Shutdown
-    print("Shutting down ML service...")
 
-# Initialize FastAPI app with lifespan
+    model_path = os.path.join(project_root, "data", "models",  "ai_hybrid_recommender_latest.pkl")
+    fe_path    = os.path.join(project_root, "data", "processed", "feature_engineer.pkl")
+
+    print(f"Loading model  : {model_path}  [exists={os.path.exists(model_path)}]")
+    print(f"Loading FE     : {fe_path}     [exists={os.path.exists(fe_path)}]")
+
+    try:
+        model = AIRecommender.load(model_path, gemini_api_key=os.getenv("GEMINI_API_KEY"))
+    except Exception:
+        print("Could not load ML model — service will use popularity fallback.")
+        traceback.print_exc()
+
+    try:
+        feature_engineer = FeatureEngineer.load(fe_path)
+    except Exception:
+        print("Could not load feature engineer.")
+        traceback.print_exc()
+
+    print(f"\nStatus — model={model is not None}  FE={feature_engineer is not None}\n")
+    yield
+    print("Shutting down Fundora ML service…")
+
+
+# ── app ───────────────────────────────────────────────────
 app = FastAPI(
-    title="Fundora ML Recommendation Service",
-    description="AI-powered startup recommendations for Fundora",
-    version="1.0.0",
-    lifespan=lifespan
+    title="Fundora ML + AI Service",
+    description="Hybrid ML recommendations powered by Random Forest + Gemini AI explanations",
+    version="2.0.0",
+    lifespan=lifespan,
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -111,212 +66,194 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Models for API requests/responses
+
+# ── request / response schemas ────────────────────────────
 class RecommendationRequest(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     user_id: int
     n_recommendations: int = 10
     exclude_viewed: bool = True
+    include_ai_explanation: bool = True
+
+
+class StartupCard(BaseModel):
+    startup_id: int
+    score: float
+    predicted_engagement: int
+    company_name: str
+    industry: str
+    revenue_growth: Optional[float] = None
+    expected_return: Optional[float] = None
+    ai_explanation: Optional[str] = None
+
 
 class RecommendationResponse(BaseModel):
     model_config = {"protected_namespaces": ()}
-    
+
     user_id: int
-    recommendations: List[Dict]
+    recommendations: List[StartupCard]
     model_version: str
     timestamp: str
 
+
 class HealthResponse(BaseModel):
     model_config = {"protected_namespaces": ()}
-    
+
     status: str
     model_loaded: bool
     feature_engineer_loaded: bool
+    gemini_enabled: bool
     timestamp: str
 
+
+class ExplainRequest(BaseModel):
+    user_id: int
+    startup_id: int
+
+
+# ── helpers ───────────────────────────────────────────────
+def _popular_startups(fe: FeatureEngineer, n: int = 10) -> List[StartupCard]:
+    df = fe.startup_features.copy()
+    df["popularity_score"] = (
+        df["view_count"].fillna(0) * 0.4
+        + df["unique_viewers"].fillna(0) * 0.3
+        + df["avg_engagement"].fillna(0) * 0.3
+    )
+    df = df.sort_values("popularity_score", ascending=False)
+    cards = []
+    for _, row in df.head(n).iterrows():
+        cards.append(StartupCard(
+            startup_id=int(row["id"]),
+            score=float(row["popularity_score"]),
+            predicted_engagement=1,
+            company_name=str(row["company_name"]),
+            industry=str(row.get("industry", "Unknown")),
+            revenue_growth=float(row.get("revenue_growth", 0) or 0) * 100,
+            expected_return=float(row.get("expected_return", 0) or 0),
+            ai_explanation=None,
+        ))
+    return cards
+
+
+# ── routes ────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    """Root endpoint"""
     return {
-        "service": "Fundora ML Recommendation Service",
-        "version": "1.0.0",
-        "status": "running",
+        "service": "Fundora ML + AI Service v2",
         "endpoints": {
-            "health": "/health",
-            "recommendations": "/api/recommendations (POST)",
-            "popular": "/api/popular (GET)"
-        }
+            "POST /api/recommendations": "Personalized recommendations",
+            "POST /api/explain":         "AI explanation for one startup",
+            "GET  /api/popular":         "Popular startups (cold start)",
+            "GET  /health":              "Service health check",
+        },
     }
 
+
 @app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
+async def health():
+    gemini_ok = bool(model and model.gemini and model.gemini.api_key)
     return HealthResponse(
         status="healthy" if (model and feature_engineer) else "degraded",
         model_loaded=model is not None,
         feature_engineer_loaded=feature_engineer is not None,
-        timestamp=datetime.now().isoformat()
+        gemini_enabled=gemini_ok,
+        timestamp=datetime.now().isoformat(),
     )
+
 
 @app.post("/api/recommendations", response_model=RecommendationResponse)
 async def get_recommendations(request: RecommendationRequest):
-    """
-    Generate personalized startup recommendations for a user
-    
-    - **user_id**: The ID of the user requesting recommendations
-    - **n_recommendations**: Number of recommendations to return (default: 10)
-    - **exclude_viewed**: Whether to exclude already viewed startups (default: true)
-    """
-    global model, feature_engineer
-    
-    if not model or not feature_engineer:
-        raise HTTPException(
-            status_code=503,
-            detail="ML model not loaded. Service unavailable."
-        )
-    
+    if not feature_engineer:
+        raise HTTPException(503, "Feature engineer not loaded.")
+
     try:
-        # Check if user exists
-        user_exists = request.user_id in feature_engineer.user_preferences['user_id'].values
-        
-        if not user_exists:
-            # Cold start - return popular startups
-            print(f"User {request.user_id} not found in training data. Using popularity-based recommendations.")
-            recommendations = get_popular_startups(
-                feature_engineer, 
-                n=request.n_recommendations
-            )
+        user_known = request.user_id in feature_engineer.user_preferences["user_id"].values
+
+        if not model or not user_known:
+            cards = _popular_startups(feature_engineer, n=request.n_recommendations)
         else:
-            # Use ML model
-            recommendations_df = model.recommend(
+            df = model.recommend(
                 user_id=request.user_id,
                 feature_engineer=feature_engineer,
                 n_recommendations=request.n_recommendations,
-                exclude_viewed=request.exclude_viewed
+                exclude_viewed=request.exclude_viewed,
+                include_explanations=request.include_ai_explanation,
             )
-            
-            # Convert to list of dicts
-            recommendations = []
-            for _, row in recommendations_df.iterrows():
+
+            cards = []
+            for _, row in df.iterrows():
                 startup = feature_engineer.startup_features[
-                    feature_engineer.startup_features['id'] == row['startup_id']
+                    feature_engineer.startup_features["id"] == row["startup_id"]
                 ].iloc[0]
-                
-                recommendations.append({
-                    'startup_id': int(row['startup_id']),
-                    'score': float(row['score']),
-                    'predicted_engagement': int(row['predicted_engagement']),
-                    'company_name': startup['company_name'],
-                    'industry': startup['industry']
-                })
-        
+
+                cards.append(StartupCard(
+                    startup_id=int(row["startup_id"]),
+                    score=float(row["score"]),
+                    predicted_engagement=int(row["predicted_engagement"]),
+                    company_name=str(startup["company_name"]),
+                    industry=str(startup.get("industry", "Unknown")),
+                    revenue_growth=round(float(startup.get("revenue_growth", 0) or 0) * 100, 1),
+                    expected_return=round(float(startup.get("expected_return", 0) or 0), 1),
+                    ai_explanation=row.get("ai_explanation"),
+                ))
+
         return RecommendationResponse(
             user_id=request.user_id,
-            recommendations=recommendations,
-            model_version="v1.0",
-            timestamp=datetime.now().isoformat()
+            recommendations=cards,
+            model_version="v2.0-gemini",
+            timestamp=datetime.now().isoformat(),
         )
-        
+
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error generating recommendations: {str(e)}"
+        traceback.print_exc()
+        raise HTTPException(500, f"Recommendation error: {e}")
+
+
+@app.post("/api/explain")
+async def explain_startup(request: ExplainRequest):
+    """Get a Gemini AI explanation for a specific user–startup pair."""
+    if not model or not feature_engineer:
+        raise HTTPException(503, "Model not loaded.")
+
+    try:
+        result = model.explain_recommendation(
+            request.user_id, request.startup_id, feature_engineer
         )
+        return {"success": True, "data": result, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        raise HTTPException(500, f"Explanation error: {e}")
+
 
 @app.get("/api/popular")
-async def get_popular_startups_endpoint(n: int = 10):
-    """
-    Get popular startups based on view count and engagement
-    Used as fallback for cold start users
-    """
-    global feature_engineer
-    
+async def popular_startups(n: int = Query(10, ge=1, le=50)):
     if not feature_engineer:
-        raise HTTPException(
-            status_code=503,
-            detail="Feature engineer not loaded"
-        )
-    
+        raise HTTPException(503, "Feature engineer not loaded.")
     try:
-        popular = get_popular_startups(feature_engineer, n=n)
-        return {
-            "popular_startups": popular,
-            "count": len(popular),
-            "timestamp": datetime.now().isoformat()
-        }
+        cards = _popular_startups(feature_engineer, n=n)
+        return {"popular_startups": [c.dict() for c in cards], "count": len(cards),
+                "timestamp": datetime.now().isoformat()}
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error fetching popular startups: {str(e)}"
-        )
+        raise HTTPException(500, f"Error: {e}")
 
-def get_popular_startups(feature_engineer, n=10):
-    """Helper function to get popular startups"""
-    # Sort by view count and engagement
-    popular = feature_engineer.startup_features.copy()
-    popular['popularity_score'] = (
-        popular['view_count'] * 0.4 + 
-        popular['unique_viewers'] * 0.3 + 
-        popular['avg_engagement'] * 0.3
-    )
-    popular = popular.sort_values('popularity_score', ascending=False)
-    
-    recommendations = []
-    for _, startup in popular.head(n).iterrows():
-        recommendations.append({
-            'startup_id': int(startup['id']),
-            'score': float(startup['popularity_score']),
-            'predicted_engagement': 1,  # Default to "view"
-            'company_name': startup['company_name'],
-            'industry': startup['industry']
-        })
-    
-    return recommendations
 
 @app.post("/api/feedback")
-async def record_feedback(
-    user_id: int,
-    startup_id: int,
-    action: str
-):
-    """
-    Record user feedback for future model retraining
-    
-    Actions: 'view', 'compare', 'watchlist'
-    """
-    # In production, save to database latur
-    
-    engagement_map = {
-        'view': 1,
-        'compare': 2,
-        'watchlist': 3
-    }
-    
-    engagement_level = engagement_map.get(action.lower(), 1)
-    
+async def record_feedback(user_id: int, startup_id: int, action: str):
+    """Record user feedback for future retraining. Actions: view | compare | watchlist"""
+    level_map = {"view": 1, "compare": 2, "watchlist": 3}
     return {
         "message": "Feedback recorded",
         "user_id": user_id,
         "startup_id": startup_id,
         "action": action,
-        "engagement_level": engagement_level,
-        "timestamp": datetime.now().isoformat()
+        "engagement_level": level_map.get(action.lower(), 1),
+        "timestamp": datetime.now().isoformat(),
     }
 
+
+# ── entry point ───────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    
     port = int(os.getenv("API_PORT", 8001))
-    
-    print("\n" + "="*60)
-    print("Starting Fundora ML Recommendation Service")
-    print("="*60)
-    print(f"API will be available at: http://localhost:{port}")
-    print(f"API docs at: http://localhost:{port}/docs")
-    print("="*60 + "\n")
-    
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port,
-        reload=False
-    )
+    print(f"\n{'='*60}\nFundora ML Service v2  →  http://localhost:{port}\nDocs  →  http://localhost:{port}/docs\n{'='*60}\n")
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
