@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     print(f"Loading FE     : {fe_path}     [exists={os.path.exists(fe_path)}]")
 
     try:
-        model = AIRecommender.load(model_path, gemini_api_key=os.getenv("GEMINI_API_KEY"))
+        model = AIRecommender.load(model_path)
     except Exception:
         print("Could not load ML model — service will use popularity fallback.")
         traceback.print_exc()
@@ -74,7 +74,6 @@ class RecommendationRequest(BaseModel):
     user_id: int
     n_recommendations: int = 10
     exclude_viewed: bool = True
-    include_ai_explanation: bool = True
 
 
 class StartupCard(BaseModel):
@@ -152,12 +151,12 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
-    gemini_ok = bool(model and model.gemini and model.gemini.api_key)
+    gemini_ok = False
     return HealthResponse(
         status="healthy" if (model and feature_engineer) else "degraded",
         model_loaded=model is not None,
         feature_engineer_loaded=feature_engineer is not None,
-        gemini_enabled=gemini_ok,
+        gemini_enabled=False,
         timestamp=datetime.now().isoformat(),
     )
 
@@ -178,7 +177,6 @@ async def get_recommendations(request: RecommendationRequest):
                 feature_engineer=feature_engineer,
                 n_recommendations=request.n_recommendations,
                 exclude_viewed=request.exclude_viewed,
-                include_explanations=request.include_ai_explanation,
             )
 
             cards = []

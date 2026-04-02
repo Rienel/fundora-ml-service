@@ -7,43 +7,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import joblib
 import os
-import json
-import requests
 from datetime import datetime
-
-
-# ──────────────────────────────────────────────────────────
-# Gemini LLM Client
-# ──────────────────────────────────────────────────────────
-
-class GeminiClient:
-    MODEL = "gemini-1.5-flash"
-    BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
-        if not self.api_key:
-            print("⚠️  GEMINI_API_KEY not set — AI explanations will be disabled.")
-
-    def generate(self, prompt: str, max_tokens: int = 300) -> str:
-        """Send a prompt to Gemini and return the text response."""
-        if not self.api_key:
-            return ""
-
-        url = f"{self.BASE_URL}/{self.MODEL}:generateContent?key={self.api_key}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.7},
-        }
-
-        try:
-            resp = requests.post(url, json=payload, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as e:
-            print(f"Gemini API error: {e}")
-            return ""
 
 
 # ──────────────────────────────────────────────────────────
@@ -56,10 +20,9 @@ class AIRecommender:
       • 40 % — Random Forest ML (engagement prediction)
       • 30 % — Collaborative Filtering (similar investors)
       • 30 % — Content-Based (TF-IDF startup similarity)
-      + Gemini LLM explains every recommendation in plain English
     """
 
-    def __init__(self, gemini_api_key: str = None):
+    def __init__(self):
         # ML model
         self.model = RandomForestClassifier(
             n_estimators=100,
@@ -78,9 +41,6 @@ class AIRecommender:
         self.startup_embeddings: dict = {}
         self.user_similarity_matrix = None
         self.user_ids: list = []
-
-        # LLM
-        self.gemini = GeminiClient(gemini_api_key)
 
     # ── text helpers ──────────────────────────────────────
 
@@ -207,81 +167,6 @@ class AIRecommender:
         total = w["ml"] * ml + w["collaborative"] * col + w["content"] * con
         return {"total_score": total, "ml_score": ml, "collaborative_score": col, "content_score": con}
 
-    # ── Gemini LLM explanation ────────────────────────────
-
-    def generate_ai_explanation(self, user_id, startup_id, feature_engineer) -> str:
-        """
-        Ask Gemini to write a short, human-friendly explanation of WHY
-        this startup was recommended to this investor.
-        Falls back to a rule-based explanation if Gemini is unavailable.
-        """
-        startup = feature_engineer.startup_features[
-            feature_engineer.startup_features["id"] == startup_id
-        ]
-        if startup.empty:
-            return "Recommended based on your investment profile."
-        startup = startup.iloc[0]
-
-        pref = feature_engineer.user_preferences[
-            feature_engineer.user_preferences["user_id"] == user_id
-        ]
-        preferred_industry = (
-            pref.iloc[0].get("preferred_industry", "technology") if not pref.empty else "technology"
-        )
-
-        # Build a concise data summary for the prompt
-        startup_summary = {
-            "name": startup.get("company_name", "Unknown"),
-            "industry": startup.get("industry", "Unknown"),
-            "revenue_growth_pct": round(float(startup.get("revenue_growth", 0) or 0) * 100, 1),
-            "expected_return_pct": round(float(startup.get("expected_return", 0) or 0), 1),
-            "profit_margin_pct": round(float(startup.get("profit_margin", 0) or 0) * 100, 1),
-            "current_ratio": round(float(startup.get("current_ratio", 0) or 0), 2),
-            "confidence_score_pct": round(float(startup.get("confidence_score", 0) or 0) * 100, 1),
-        }
-
-        scores = self.hybrid_score(user_id, startup_id, feature_engineer)
-
-        prompt = f"""You are an AI investment advisor for Fundora, a startup investment platform.
-
-A startup called "{startup_summary['name']}" in the {startup_summary['industry']} industry has been 
-recommended to an investor whose preferred industry is {preferred_industry}.
-
-Key financial metrics:
-- Revenue Growth: {startup_summary['revenue_growth_pct']}%
-- Expected Return: {startup_summary['expected_return_pct']}%
-- Profit Margin: {startup_summary['profit_margin_pct']}%
-- Current Ratio (liquidity): {startup_summary['current_ratio']}
-- Data Confidence: {startup_summary['confidence_score_pct']}%
-
-Recommendation scores (0–1):
-- ML behavioral score: {scores['ml_score']:.2f}
-- Investor similarity score: {scores['collaborative_score']:.2f}
-- Content match score: {scores['content_score']:.2f}
-
-Write a 2–3 sentence explanation (in a friendly, professional tone) of why this startup 
-is a good match for this investor. Be specific about the numbers. Do NOT use bullet points."""
-
-        llm_text = self.gemini.generate(prompt, max_tokens=200)
-
-        # Fallback if Gemini unavailable
-        if not llm_text:
-            reasons = []
-            if startup_summary["revenue_growth_pct"] > 20:
-                reasons.append(f"{startup_summary['revenue_growth_pct']}% revenue growth")
-            if startup_summary["expected_return_pct"] > 15:
-                reasons.append(f"{startup_summary['expected_return_pct']}% expected return")
-            if startup.get("industry") == preferred_industry:
-                reasons.append(f"matches your preferred {preferred_industry} sector")
-            if not reasons:
-                reasons.append("strong overall financial profile")
-            return (
-                f"{startup_summary['name']} was recommended because of its "
-                + ", ".join(reasons) + "."
-            )
-
-        return llm_text
-
     # ── training ──────────────────────────────────────────
 
     def train(self, X, y, feature_columns, feature_engineer):
@@ -380,16 +265,11 @@ is a good match for this investor. Be specific about the numbers. Do NOT use bul
                 "collaborative_score": s["collaborative_score"],
                 "content_score": s["content_score"],
                 "predicted_engagement": predicted_engagement,
+                "ai_explanation": None,
             }
             rows.append(row)
 
         df = pd.DataFrame(rows).sort_values("score", ascending=False).head(n_recommendations)
-
-        if include_explanations:
-            df["ai_explanation"] = df["startup_id"].apply(
-                lambda sid: self.generate_ai_explanation(user_id, sid, feature_engineer)
-            )
-
         return df
 
     # ── explain single startup ────────────────────────────
@@ -400,8 +280,6 @@ is a good match for this investor. Be specific about the numbers. Do NOT use bul
             feature_engineer.startup_features["id"] == startup_id
         ].iloc[0]
 
-        ai_text = self.generate_ai_explanation(user_id, startup_id, feature_engineer)
-
         return {
             "startup_name": startup["company_name"],
             "overall_score": scores["total_score"],
@@ -410,7 +288,7 @@ is a good match for this investor. Be specific about the numbers. Do NOT use bul
                 "collaborative": scores["collaborative_score"],
                 "content": scores["content_score"],
             },
-            "ai_explanation": ai_text,
+            "ai_explanation": None,
         }
 
     # ── persistence ───────────────────────────────────────
@@ -427,7 +305,7 @@ is a good match for this investor. Be specific about the numbers. Do NOT use bul
             "user_similarity_matrix": self.user_similarity_matrix,
             "user_ids": self.user_ids,
             "trained_at": datetime.now().isoformat(),
-            "model_type": "AIRecommender_Gemini",
+            "model_type": "AIRecommender_Hybrid",
         }
         joblib.dump(data, path)
         print(f"Model saved to {path}")
@@ -435,9 +313,9 @@ is a good match for this investor. Be specific about the numbers. Do NOT use bul
         joblib.dump(data, path.replace("_latest", f"_{ts}"))
 
     @staticmethod
-    def load(path: str = "data/models/ai_hybrid_recommender_latest.pkl", gemini_api_key: str = None):
+    def load(path: str = "data/models/ai_hybrid_recommender_latest.pkl"):
         data = joblib.load(path)
-        r = AIRecommender(gemini_api_key=gemini_api_key or os.getenv("GEMINI_API_KEY"))
+        r = AIRecommender()
         r.model = data["model"]
         r.feature_columns = data["feature_columns"]
         r.is_trained = data["is_trained"]
