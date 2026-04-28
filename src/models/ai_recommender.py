@@ -156,8 +156,10 @@ class AIRecommender:
             "user_avg_engagement": pref.get("avg_engagement", 0),
         }
         X = np.array([feat[c] for c in self.feature_columns]).reshape(1, -1)
+        classes = self.model.classes_
         proba = self.model.predict_proba(X)[0]
-        return (proba[0] * 1 + proba[1] * 2 + proba[2] * 3) / 3.0
+        score = sum(p * c for p, c in zip(proba, classes)) / 3.0
+        return score
 
     def hybrid_score(self, user_id, startup_id, feature_engineer, weights=None) -> dict:
         w = weights or {"ml": 0.4, "collaborative": 0.3, "content": 0.3}
@@ -184,8 +186,28 @@ class AIRecommender:
         self.model.fit(X_train, y_train)
         acc = accuracy_score(y_val, self.model.predict(X_val))
         print(f"   Validation accuracy: {acc:.2%}")
-        print(classification_report(y_val, self.model.predict(X_val),
-                                    target_names=["View", "Compare", "Watchlist"]))
+        y_pred_val = self.model.predict(X_val)
+        present_labels = sorted(list(set(y_val)))
+        label_names = {1: "View", 2: "Compare", 3: "Watchlist"}
+        present_names = [label_names[l] for l in present_labels]
+
+        print(classification_report(y_pred_val, y_val,
+            labels=present_labels,
+            target_names=present_names))
+
+        from sklearn.metrics import confusion_matrix
+        import pandas as pd
+        cm = confusion_matrix(y_val, y_pred_val, labels=present_labels)
+        print("\nConfusion Matrix:")
+        print("Rows=Actual, Cols=Predicted | Labels:", present_names)
+        print(cm)
+
+        feat_imp = pd.DataFrame({
+            'feature': self.feature_columns,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        print("\nTop 10 Feature Importances:")
+        print(feat_imp.head(10).to_string(index=False))
 
         # 2. NLP embeddings
         print("\n2. Building NLP content layer…")

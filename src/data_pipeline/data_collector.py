@@ -22,7 +22,7 @@ class DataCollector:
             s.current_revenue,
             s.previous_revenue,
             s.confidence_percentage,
-            s.is_deck_builder,
+            CASE WHEN s.source_deck_id IS NOT NULL THEN TRUE ELSE FALSE END as is_deck_builder,
             s.current_valuation,
             s.expected_future_valuation,
             s.years_to_future_valuation,
