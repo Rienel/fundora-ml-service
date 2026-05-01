@@ -8,12 +8,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import joblib
 import os
 from datetime import datetime
-import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    confusion_matrix,
-    ConfusionMatrixDisplay,
-)
-
+from sklearn.metrics import confusion_matrix
 
 class AIRecommender:
     """
@@ -478,32 +473,5 @@ if __name__ == "__main__":
 
     print("\n4. Saving model...")
     recommender.save()
-
-    print("\n5. Generating confusion matrix figure...")
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, accuracy_score
-    import matplotlib.pyplot as plt
-
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    y_pred = recommender.model.predict(X_val)
-
-    present_labels = sorted(list(set(y_val)))
-    label_map      = {1: 'View (1)', 2: 'Compare (2)', 3: 'Watchlist (3)'}
-    present_names  = [label_map[l] for l in present_labels]
-
-    cm   = confusion_matrix(y_val, y_pred, labels=present_labels)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=present_names)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    disp.plot(values_format='d', cmap='Blues', ax=ax, colorbar=True)
-    ax.set_title('Confusion Matrix of Engagement Prediction',
-                 fontsize=14, fontweight='bold', pad=20)
-    ax.set_xlabel('Predicted Label', fontsize=12, fontweight='bold', labelpad=10)
-    ax.set_ylabel('True Label',      fontsize=12, fontweight='bold', labelpad=10)
-    plt.tight_layout()
-    plt.savefig('fig_confusion_matrix.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print("   Saved fig_confusion_matrix.png")
 
     print("\nDone! Model is trained, saved, and ready.")
